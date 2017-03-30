@@ -4,16 +4,21 @@ library(e1071)
 library(dplyr)
 library(reshape2)
 library(ModelMetrics)
+install.packages("matrix")
+library(Matrix)
+library(data.table)
+install.packages("xgboost")
+library(xgboost)
 
 
 #upload the data
-
 setwd("C:/Users/hvg15/Desktop/R/Allstate")
 
 allstate_train <- read.csv("train.csv", header = TRUE)
 
 allstate_test <- read.csv("test.csv", header = TRUE)
-nrow(allstate_train)
+
+allstate_train_nrow <- nrow(allstate_train)
 
 ncol(allstate_train)
 
@@ -73,26 +78,108 @@ allstate_train_cor_melt<-allstate_train_cor_melt[!duplicated(new_allstate_train_
 #cont9 and cont1 show high correlations one can be removed safely
 
 
-#intial linear regression model
-initial.large.model = lm(loss ~ . , data = allstate_train)
-
-initial.large.model
-
-summary(initial.large.model)
-
-rmse(initial.large.model$residuals)
-
+#data preparation for modelling
 #transformation of prediction variable loss with log10 + 200
 allstate_train$loss <- log10(allstate_train$loss + 200)
+model_allstate_trainid <- allstate_train$id
+model_allstate_trainloss <- allstate_train$loss
+model_allstate_testid <- allstate_test$id
+allstate_train[,c("id","loss")] <- NULL
+allstate_test[,"id"] <-  NULL
+allstate_full<- rbind(allstate_train,allstate_test)
+allstate_full_nrow <- nrow(allstate_full)
 
-#linear regression after log transformation
-second.large.model = lm(loss ~ . , data = allstate_train)
+
+#one hot coding
+features<- names(allstate_full)
+factor_features<-vector()
+for(feature in features){
+  if(class(allstate_full[,feature])=="factor"){
+    allstate_full[,feature]<- as.numeric(allstate_full[,feature])-1
+  }
+}
+
+model_allstate_full <- allstate_full
+model_allstate_full[,c("cont12","cont9")] <- NULL
+model_allstate_train <- model_allstate_full[1:allstate_train_nrow,]
+model_allstate_test <- model_allstate_full[(allstate_train_nrow+1):allstate_full_nrow,]
+
+
+#intial linear regression model
+initial.large.model = lm(model_allstate_trainloss ~ . , data = model_allstate_train)
+
+summary(initial.large.model)
+predict_initial.large.model <- predict(initial.large.model, newdata = model_allstate_test)
+
+#what is present in initial.large.model
+names(initial.large.model)
+
+#fitted values in the initial.large.model represents predicted values
+#plot of observed and predicted values
+plot(model_allstate_trainloss,initial.large.model$fitted.values, pch = 19)
+
+training.rmse    = sqrt(   mean( (model_allstate_trainloss - initial.large.model$fitted.values)^2 )   )
+training.rmse
+
+#training rmse 0.2246233
+write.csv(cbind(model_allstate_testid, predict_initial.large.model),file = "submission.csv")
+
+#reverting the logarthamic transformation
+predict_initial.large.model<- (10^predict_initial.large.model)-200
+
+
+#second linear regression model without log transformation of loss varibale
+second.large.model = lm(model_allstate_trainloss ~ . , data = model_allstate_train)
+
 summary(second.large.model)
+predict_second.large.model <- predict(second.large.model, newdata = model_allstate_test)
 
-predict_second.large.model <- predict(second.large.model, newdata = allstate_test)
+plot(model_allstate_trainloss,second.large.model$fitted.values, pch = 19)
+
+training.rmse_second    = sqrt(   mean( (model_allstate_trainloss - second.large.model$fitted.values)^2 )   )
+training.rmse_second
+
+#training rmse second is 2088.88
 
 
+#Xgboost
+xgb_matrix_train_AllState<- xgb.DMatrix(as.matrix(model_allstate_train),label=model_allstate_trainloss)
+xgb_matrix_test_AllState<- xgb.DMatrix(as.matrix(model_allstate_test))
+xgb_parameters_AllState<- list(
+                                objective='reg:linear',
+                                seed=2000,
+                                colsample_bytree=0.7,
+                                subsample=0.7,
+                                eta=0.3,
+                                max_depth=8,
+                                num_parallel_tree=1,
+                                min_child_weight=1,
+                                base_score=7)
 
 
+xg_eval_mae<- function(yhat,xgb_matrix_train_AllState){
+  y=getinfo(xgb_matrix_train_AllState,"label")
+  err= mae(exp(y),exp(yhat))
+  return(list(metric="error",value=err))
+  
+}
+res = xgb.cv(xgb_parameters_AllState,
+             xgb_matrix_train_AllState,
+             nrounds=2550,
+             nfold=10,
+             early_stopping_rounds=15,
+             print_every_n = 10,
+             verbose= 1,
+             feval=xg_eval_mae,
+             maximize=FALSE)
+
+
+best_nrounds= res$best_iteration
+cv_mean<- res$evaluation_log$train_error_mean[best_nrounds]
+cv_std<- res$evaluation_log$train_error_std[best_nrounds]
+cat(paste0('CV-Mean: ',cv_mean,' ', cv_std))
+
+gbdt<- xgb.train(xgb_parameters_AllState,xgb_matrix_train_AllState,best_nrounds)
+submission= predict(gbdt,xgb_matrix_test_AllState)
 
 
